@@ -1,0 +1,6 @@
+{
+  "name": "NeuroQuery AI",
+  "description": "Smart PDF Chatbot powered by Gemini AI. Ask questions, get precise answers based strictly on relevant PDF content, and view exact page citations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
