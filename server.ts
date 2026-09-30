@@ -61,7 +61,12 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 async function generateContentWithRetry(ai: GoogleGenAI, params: any) {
-  const models = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
+const models = [
+  'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-flash-latest',
+];
   let lastErr: any = null;
 
   for (const model of models) {
