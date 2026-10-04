@@ -69,6 +69,22 @@ export default function App() {
       setHighlightExcerpt(null);
       setIsPdfPanelOpen(true);
       setIsUploadModalOpen(false);
+
+      // Load persistent chat history from Supabase / backend API
+      try {
+        const chatRes = await fetch(`/api/documents/${documentId}/chat`);
+        if (chatRes.ok) {
+          const chatData = await chatRes.json();
+          if (Array.isArray(chatData.messages) && chatData.messages.length > 0) {
+            setConversations((previous) => ({
+              ...previous,
+              [documentId]: chatData.messages,
+            }));
+          }
+        }
+      } catch (chatErr) {
+        console.warn('Could not load chat history from server:', chatErr);
+      }
     } catch (err) {
       console.error('Error selecting document:', err);
       if (openModalOnFail) setIsUploadModalOpen(true);
@@ -345,10 +361,15 @@ export default function App() {
     }
   };
 
-  const handleClearChat = () => {
+  const handleClearChat = async () => {
     if (!document) return;
     setConversations((previous) => ({ ...previous, [document.id]: [] }));
     setHighlightExcerpt(null);
+    try {
+      await fetch(`/api/documents/${document.id}/chat`, { method: 'DELETE' });
+    } catch (clearErr) {
+      console.warn('Could not clear chat history on server:', clearErr);
+    }
   };
 
   const handleTogglePdfPanel = () => {

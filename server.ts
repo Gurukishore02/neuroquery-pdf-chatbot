@@ -5,66 +5,41 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createCanvas } from '@napi-rs/canvas';
-import { getDocument, OPS } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { getDocument as getPdfDocument, OPS } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { SAMPLE_DOCUMENTS } from './server/samplePdfs.ts';
+import {
+  isSupabaseConfigured,
+  ensureDocumentsBucketExists,
+  uploadPdfToSupabaseStorage,
+  downloadPdfFromSupabaseStorage,
+  downloadVisualImageFromSupabaseStorage,
+  createSignedUrl,
+  getDocumentFromDb,
+  listDocumentsFromDb,
+  findDocumentByContentHash,
+  upsertDocumentToDb,
+  updateDocumentStatusInDb,
+  saveChunksToDb,
+  saveVisualsToDb,
+  saveChatMessage,
+  getChatMessages,
+  clearChatMessages,
+  StoredDoc,
+  StoredVisual,
+  Chunk,
+  VisualType,
+} from './server/supabase.ts';
 
-dotenv.config();
+const isServerlessRuntime = process.env.NETLIFY === 'true' || typeof process.env.AWS_LAMBDA_FUNCTION_NAME === 'string';
+if (!isServerlessRuntime) dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const app = express();
+export const app = express();
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-interface Chunk {
-  chunkId: string;
-  documentId: string;
-  userId: string;
-  pageNumber: number;
-  text: string;
-  embedding?: number[];
-}
-
-interface StoredDoc {
-  id: string;
-  userId?: string;
-  name: string;
-  base64: string;
-  size: number;
-  pageCount: number;
-  summary: string;
-  suggestedQuestions: string[];
-  chunks: Chunk[];
-  visuals: StoredVisual[];
-  pagesText: string[];
-  visualCandidatePages: number[];
-  visualAnalyzedPages: number[];
-  contentHash: string;
-  indexingStatus: 'queued' | 'processing' | 'ready' | 'error';
-  textIndexReady: boolean;
-  visualIndexReady: boolean;
-  visualIndexStatus: 'queued' | 'processing' | 'ready' | 'error';
-  indexedChunks: number;
-  indexingError?: string;
-  visualIndexError?: string;
-  uploadedAt: number;
-}
-
-type VisualType = 'image' | 'figure' | 'diagram' | 'chart' | 'graph' | 'table' | 'flowchart' | 'illustration' | 'map' | 'screenshot' | 'other';
-
-interface StoredVisual {
-  id: string;
-  documentId: string;
-  pageNumber: number;
-  type: VisualType;
-  title: string;
-  caption: string;
-  description: string;
-  imageData: string;
-  embedding: number[];
-}
 
 interface PreparedPdf {
   pageCount: number;
@@ -75,9 +50,11 @@ interface PreparedPdf {
   loadingTask: any;
 }
 
-const documentStore = new Map<string, StoredDoc>();
+// In-memory cache for fast hot-path retrieval. The primary source of truth is Supabase.
+const documentCache = new Map<string, StoredDoc>();
 const activeTextIndexJobs = new Set<string>();
 const activeVisualIndexJobs = new Set<string>();
+
 const VECTOR_SIMILARITY_THRESHOLD = 0.45;
 const VISUAL_RELEVANCE_THRESHOLD = 0.90;
 const VISUAL_MIN_SEMANTIC_SIMILARITY = 0.76;
@@ -94,6 +71,28 @@ const TEXT_CHUNK_MAX_CHARS = 3000;
 const TEXT_CHUNK_OVERLAP_CHARS = 350;
 const EMBEDDING_MODEL = 'gemini-embedding-001';
 const VISUAL_INDEX_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Loads a document by checking Supabase (source of truth), then falling back to in-memory cache.
+ */
+async function getDocument(documentId: string): Promise<StoredDoc | undefined> {
+  if (isSupabaseConfigured()) {
+    try {
+      const fromDb = await getDocumentFromDb(documentId);
+      if (fromDb) {
+        const cached = documentCache.get(documentId);
+        if (!fromDb.base64 && cached?.base64) {
+          fromDb.base64 = cached.base64;
+        }
+        documentCache.set(documentId, fromDb);
+        return fromDb;
+      }
+    } catch (err: any) {
+      console.error(`[SUPABASE] Failed to fetch document ${documentId}: ${err.message}`);
+    }
+  }
+  return documentCache.get(documentId);
+}
 
 function cosineSimilarity(vecA: number[], vecB: number[]): number {
   let dotProduct = 0;
@@ -202,7 +201,7 @@ async function generateContentWithRetry(ai: GoogleGenAI, params: any) {
       } catch (err: any) {
         lastErr = err;
         const errMsg = String(err?.message || err);
-        const isTransient = errMsg.includes('503') || errMsg.includes('429') || errMsg.includes('UNAVAILABLE') || errMsg.includes('ResourceExhausted');
+        const isTransient = errMsg.includes('503') || errMsg.includes('429') || errMsg.includes('UNAVAILABLE') || errMsg.includes('ResourceExhausted') || errMsg.includes('fetch failed') || errMsg.includes('ECONNRESET');
         if (isTransient && attempt < 2) {
           await new Promise((r) => setTimeout(r, (attempt + 1) * 1200));
           continue;
@@ -260,7 +259,7 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, task: (item: 
 
 async function extractPdfLocally(base64: string, documentId: string, userId: string): Promise<PreparedPdf> {
   const extractionStarted = Date.now();
-  const loadingTask = getDocument({
+  const loadingTask = getPdfDocument({
     data: Uint8Array.from(Buffer.from(base64, 'base64')),
     useSystemFonts: true,
   });
@@ -281,7 +280,7 @@ async function extractPdfLocally(base64: string, documentId: string, userId: str
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
       const page = await pdf.getPage(pageNumber);
       const textContent = await page.getTextContent();
-      const textItems = textContent.items.filter((item) => 'str' in item && !!item.str.trim()) as { str: string; transform: number[] }[];
+      const textItems = textContent.items.filter((item: any) => 'str' in item && !!item.str.trim()) as { str: string; transform: number[] }[];
       const pageText = textItems.map((item: any) => item.str).join(' ').trim();
       pagesText.push(pageText);
       const chunkingStarted = Date.now();
@@ -372,7 +371,7 @@ async function describePageVisuals(ai: GoogleGenAI, imageBase64: string, abortSi
   }
 }
 
-function logIndexError(document: StoredDoc, stage: string, error: unknown, visual = false): void {
+async function logIndexError(document: StoredDoc, stage: string, error: unknown, visual = false): Promise<void> {
   const message = String((error as Error)?.message || error);
   if (visual) {
     document.visualIndexStatus = 'error';
@@ -382,19 +381,46 @@ function logIndexError(document: StoredDoc, stage: string, error: unknown, visua
     document.indexingError = message;
     document.textIndexReady = false;
   }
+  documentCache.set(document.id, document);
+
+  if (isSupabaseConfigured()) {
+    try {
+      if (visual) {
+        await updateDocumentStatusInDb(document.id, {
+          visualIndexStatus: 'error',
+          visualIndexError: message,
+        });
+      } else {
+        await updateDocumentStatusInDb(document.id, {
+          indexingStatus: 'error',
+          textIndexReady: false,
+          indexingError: message,
+        });
+      }
+    } catch (dbErr: any) {
+      console.error(`[SUPABASE] Failed to persist index error for ${document.id}: ${dbErr.message}`);
+    }
+  }
+
   console.error(`[INDEX ERROR]\ndocumentId: ${document.id}\nstage: ${stage}\nerror: ${message}`);
 }
 
 async function indexDocumentText(documentId: string): Promise<void> {
-  const document = documentStore.get(documentId);
+  const document = await getDocument(documentId);
   if (!document || document.textIndexReady || activeTextIndexJobs.has(documentId)) return;
   activeTextIndexJobs.add(documentId);
   document.indexingStatus = 'processing';
   document.indexingError = undefined;
+  documentCache.set(documentId, document);
+
+  if (isSupabaseConfigured()) {
+    await updateDocumentStatusInDb(documentId, { indexingStatus: 'processing', indexingError: undefined });
+  }
+
   const stageStarted = Date.now();
   let stage = 'text embedding';
   try {
-    console.log(`[INDEX] Started: ${document.name} (${documentId})`);
+    console.log(`[INDEXING] Started: ${document.name} (${documentId})`);
     console.log(`[INDEX] PDF extraction complete: ${document.name}`);
     console.log(`[INDEX] Pages: ${document.pageCount}`);
     console.log(`[INDEX] Chunks created: ${document.chunks.length}`);
@@ -405,12 +431,12 @@ async function indexDocumentText(documentId: string): Promise<void> {
       .map((chunk, index) => ({ chunk, index }))
       .filter(({ chunk }) => !chunk.embedding?.length);
     const embeddingStarted = Date.now();
-    console.log(`[INDEX] Embeddings started: chunks=${chunkIndices.length}`);
+    console.log(`[EMBEDDING] Embeddings started: chunks=${chunkIndices.length}`);
     const embeddings = await embedTexts(ai, chunkIndices.map(({ chunk }) => chunk.text));
     chunkIndices.forEach(({ index }, embeddingIndex) => {
       document.chunks[index].embedding = embeddings[embeddingIndex];
     });
-    console.log(`[INDEX] Embeddings complete: chunks=${embeddings.length} elapsedMs=${Date.now() - embeddingStarted}`);
+    console.log(`[EMBEDDING] Embeddings complete: chunks=${embeddings.length} elapsedMs=${Date.now() - embeddingStarted}`);
 
     stage = 'text index verification';
     console.log(`[INDEX] Verification started: ${documentId}`);
@@ -428,16 +454,28 @@ async function indexDocumentText(documentId: string): Promise<void> {
     document.textIndexReady = true;
     document.indexingStatus = 'ready';
     document.indexingError = undefined;
+    documentCache.set(documentId, document);
+
+    if (isSupabaseConfigured()) {
+      await saveChunksToDb(document.chunks);
+      await updateDocumentStatusInDb(documentId, {
+        textIndexReady: true,
+        indexingStatus: 'ready',
+        indexedChunks: document.indexedChunks,
+        indexingError: undefined,
+      });
+    }
+
     console.log(`[INDEX] Document READY: ${documentId} indexedChunks=${document.indexedChunks} elapsedMs=${Date.now() - stageStarted}`);
   } catch (error) {
-    logIndexError(document, stage, error);
+    await logIndexError(document, stage, error);
   } finally {
     activeTextIndexJobs.delete(documentId);
   }
 }
 
 async function indexDocumentVisuals(documentId: string, prepared?: PreparedPdf): Promise<void> {
-  const document = documentStore.get(documentId);
+  const document = await getDocument(documentId);
   let loadingTask = prepared?.loadingTask;
   let pdf = prepared?.pdf;
   if (!document || document.visualIndexReady || activeVisualIndexJobs.has(documentId)) {
@@ -455,6 +493,10 @@ async function indexDocumentVisuals(documentId: string, prepared?: PreparedPdf):
   if (candidatePages.length === 0) {
     document.visualIndexReady = true;
     document.visualIndexStatus = 'ready';
+    documentCache.set(documentId, document);
+    if (isSupabaseConfigured()) {
+      await updateDocumentStatusInDb(documentId, { visualIndexReady: true, visualIndexStatus: 'ready' });
+    }
     try {
       await loadingTask?.destroy();
     } catch (error) {
@@ -466,14 +508,26 @@ async function indexDocumentVisuals(documentId: string, prepared?: PreparedPdf):
   activeVisualIndexJobs.add(documentId);
   document.visualIndexStatus = 'processing';
   document.visualIndexError = undefined;
+  documentCache.set(documentId, document);
+  if (isSupabaseConfigured()) {
+    await updateDocumentStatusInDb(documentId, { visualIndexStatus: 'processing', visualIndexError: undefined });
+  }
+
   let stage = 'visual PDF rendering';
   const visualStarted = Date.now();
   const visualAbortSignal = AbortSignal.timeout(VISUAL_INDEX_TIMEOUT_MS);
-  console.log(`[INDEX] Visual indexing started: documentId=${documentId} candidatePages=${candidatePages.length}`);
+  console.log(`[VISUAL INDEXING] Visual indexing started: documentId=${documentId} candidatePages=${candidatePages.length}`);
   try {
     if (!pdf) {
-      loadingTask = getDocument({
-        data: Uint8Array.from(Buffer.from(document.base64, 'base64')),
+      let pdfBase64 = document.base64;
+      if (!pdfBase64 && document.storagePath && isSupabaseConfigured()) {
+        const buf = await downloadPdfFromSupabaseStorage(document.storagePath);
+        if (buf) pdfBase64 = buf.toString('base64');
+      }
+      if (!pdfBase64) throw new Error('Cannot load PDF content for visual rendering.');
+
+      loadingTask = getPdfDocument({
+        data: Uint8Array.from(Buffer.from(pdfBase64, 'base64')),
         useSystemFonts: true,
       });
       pdf = await loadingTask.promise;
@@ -481,95 +535,95 @@ async function indexDocumentVisuals(documentId: string, prepared?: PreparedPdf):
     const ai = getGeminiClient();
     stage = 'visual description';
     await mapWithConcurrency(candidatePages, 2, async (pageNumber) => {
-        const page = await pdf.getPage(pageNumber);
-        try {
-          const originalViewport = page.getViewport({ scale: 1 });
-          const scale = Math.min(1.2, 900 / originalViewport.width);
-          const viewport = page.getViewport({ scale });
-          const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
-          await page.render({
-            canvasContext: canvas.getContext('2d') as unknown as CanvasRenderingContext2D,
-            viewport,
-            canvas: canvas as unknown as HTMLCanvasElement,
-          }).promise;
-          const imageBase64 = canvas.toBuffer('image/jpeg', 72).toString('base64');
-          const pageVisuals = await describePageVisuals(ai, imageBase64, visualAbortSignal);
-          console.log(`[VISUAL PAGE] documentId=${documentId} page=${pageNumber} detected=${pageVisuals.length}`);
-          const visuals = pageVisuals.flatMap((visual, visualIndex) => {
-            const description = String(visual.description || '').trim();
-            if (!description) {
-              console.log(`[VISUAL REJECTED] documentId=${documentId} page=${pageNumber} visual=${visualIndex + 1} reason=empty description`);
-              return [];
-            }
-            const bounds = visual.bounds;
-            if (!bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite)) {
-              console.log(`[VISUAL REJECTED] documentId=${documentId} page=${pageNumber} visual=${visualIndex + 1} reason=invalid bounds`);
-              return [];
-            }
-            const boundsArePixels = [bounds.x, bounds.y, bounds.width, bounds.height].some((value) => value > 1);
-            const normalizedX = boundsArePixels ? bounds.x / viewport.width : bounds.x;
-            const normalizedY = boundsArePixels ? bounds.y / viewport.height : bounds.y;
-            const normalizedWidth = boundsArePixels ? bounds.width / viewport.width : bounds.width;
-            const normalizedHeight = boundsArePixels ? bounds.height / viewport.height : bounds.height;
-            let left = Math.max(0, Math.min(1, normalizedX));
-            let top = Math.max(0, Math.min(1, normalizedY));
-            let right = Math.max(left, Math.min(1, normalizedX + normalizedWidth));
-            let bottom = Math.max(top, Math.min(1, normalizedY + normalizedHeight));
-            let expanded = false;
-            const boxWidth = right - left;
-            const boxHeight = bottom - top;
-            if (boxWidth < 0.18) {
-              const centerX = (left + right) / 2;
-              left = Math.max(0, Math.min(0.76, centerX - 0.12));
-              right = Math.min(1, left + 0.24);
-              expanded = true;
-            }
-            if (boxHeight < 0.14) {
-              const centerY = (top + bottom) / 2;
-              top = Math.max(0, Math.min(0.82, centerY - 0.09));
-              bottom = Math.min(1, top + 0.18);
-              expanded = true;
-            }
-            console.log(`[VISUAL CROP] documentId=${documentId} page=${pageNumber} raw=${JSON.stringify(bounds)} normalized=${left.toFixed(3)},${top.toFixed(3)},${(right - left).toFixed(3)},${(bottom - top).toFixed(3)} expanded=${expanded}`);
-            const paddingX = Math.round(viewport.width * 0.012);
-            const paddingY = Math.round(viewport.height * 0.012);
-            const cropX = Math.max(0, Math.floor(left * viewport.width) - paddingX);
-            const cropY = Math.max(0, Math.floor(top * viewport.height) - paddingY);
-            const cropWidth = Math.min(canvas.width - cropX, Math.ceil((right - left) * viewport.width) + paddingX * 2);
-            const cropHeight = Math.min(canvas.height - cropY, Math.ceil((bottom - top) * viewport.height) + paddingY * 2);
-            if (cropWidth < 24 || cropHeight < 24) {
-              console.log(`[VISUAL REJECTED] documentId=${documentId} page=${pageNumber} visual=${visualIndex + 1} reason=tiny crop width=${cropWidth} height=${cropHeight}`);
-              return [];
-            }
-            const cropCanvas = createCanvas(cropWidth, cropHeight);
-            cropCanvas.getContext('2d').drawImage(canvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
-            const visualImageBase64 = cropCanvas.toBuffer('image/jpeg', 78).toString('base64');
-            const caption = String(visual.caption || '').trim();
-            const title = String(visual.title || caption || description.slice(0, 80)).trim();
-            const allowedTypes: VisualType[] = ['image', 'figure', 'diagram', 'chart', 'graph', 'table', 'flowchart', 'illustration', 'map', 'screenshot', 'other'];
-            const type = allowedTypes.includes(visual.type as VisualType) ? visual.type as VisualType : 'other';
-            return [{
-              id: `${documentId}_p${pageNumber}_v${visualIndex + 1}`,
-              documentId,
-              pageNumber,
-              type,
-              title,
-              caption,
-              description,
-              imageData: `data:image/jpeg;base64,${visualImageBase64}`,
-              embedding: [],
-            }];
-          });
-          document.visualAnalyzedPages = [...new Set([...document.visualAnalyzedPages, pageNumber])];
-          document.visuals = [...document.visuals.filter((visual) => visual.pageNumber !== pageNumber), ...visuals];
-        } finally {
-          page.cleanup();
-        }
-      });
+      const page = await pdf.getPage(pageNumber);
+      try {
+        const originalViewport = page.getViewport({ scale: 1 });
+        const scale = Math.min(1.2, 900 / originalViewport.width);
+        const viewport = page.getViewport({ scale });
+        const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+        await page.render({
+          canvasContext: canvas.getContext('2d') as unknown as CanvasRenderingContext2D,
+          viewport,
+          canvas: canvas as unknown as HTMLCanvasElement,
+        }).promise;
+        const imageBase64 = canvas.toBuffer('image/jpeg', 72).toString('base64');
+        const pageVisuals = await describePageVisuals(ai, imageBase64, visualAbortSignal);
+        console.log(`[VISUAL PAGE] documentId=${documentId} page=${pageNumber} detected=${pageVisuals.length}`);
+        const visuals = pageVisuals.flatMap((visual, visualIndex) => {
+          const description = String(visual.description || '').trim();
+          if (!description) {
+            console.log(`[VISUAL REJECTED] documentId=${documentId} page=${pageNumber} visual=${visualIndex + 1} reason=empty description`);
+            return [];
+          }
+          const bounds = visual.bounds;
+          if (!bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite)) {
+            console.log(`[VISUAL REJECTED] documentId=${documentId} page=${pageNumber} visual=${visualIndex + 1} reason=invalid bounds`);
+            return [];
+          }
+          const boundsArePixels = [bounds.x, bounds.y, bounds.width, bounds.height].some((value) => value > 1);
+          const normalizedX = boundsArePixels ? bounds.x / viewport.width : bounds.x;
+          const normalizedY = boundsArePixels ? bounds.y / viewport.height : bounds.y;
+          const normalizedWidth = boundsArePixels ? bounds.width / viewport.width : bounds.width;
+          const normalizedHeight = boundsArePixels ? bounds.height / viewport.height : bounds.height;
+          let left = Math.max(0, Math.min(1, normalizedX));
+          let top = Math.max(0, Math.min(1, normalizedY));
+          let right = Math.max(left, Math.min(1, normalizedX + normalizedWidth));
+          let bottom = Math.max(top, Math.min(1, normalizedY + normalizedHeight));
+          let expanded = false;
+          const boxWidth = right - left;
+          const boxHeight = bottom - top;
+          if (boxWidth < 0.18) {
+            const centerX = (left + right) / 2;
+            left = Math.max(0, Math.min(0.76, centerX - 0.12));
+            right = Math.min(1, left + 0.24);
+            expanded = true;
+          }
+          if (boxHeight < 0.14) {
+            const centerY = (top + bottom) / 2;
+            top = Math.max(0, Math.min(0.82, centerY - 0.09));
+            bottom = Math.min(1, top + 0.18);
+            expanded = true;
+          }
+          console.log(`[VISUAL CROP] documentId=${documentId} page=${pageNumber} raw=${JSON.stringify(bounds)} normalized=${left.toFixed(3)},${top.toFixed(3)},${(right - left).toFixed(3)},${(bottom - top).toFixed(3)} expanded=${expanded}`);
+          const paddingX = Math.round(viewport.width * 0.012);
+          const paddingY = Math.round(viewport.height * 0.012);
+          const cropX = Math.max(0, Math.floor(left * viewport.width) - paddingX);
+          const cropY = Math.max(0, Math.floor(top * viewport.height) - paddingY);
+          const cropWidth = Math.min(canvas.width - cropX, Math.ceil((right - left) * viewport.width) + paddingX * 2);
+          const cropHeight = Math.min(canvas.height - cropY, Math.ceil((bottom - top) * viewport.height) + paddingY * 2);
+          if (cropWidth < 24 || cropHeight < 24) {
+            console.log(`[VISUAL REJECTED] documentId=${documentId} page=${pageNumber} visual=${visualIndex + 1} reason=tiny crop width=${cropWidth} height=${cropHeight}`);
+            return [];
+          }
+          const cropCanvas = createCanvas(cropWidth, cropHeight);
+          cropCanvas.getContext('2d').drawImage(canvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+          const visualImageBase64 = cropCanvas.toBuffer('image/jpeg', 78).toString('base64');
+          const caption = String(visual.caption || '').trim();
+          const title = String(visual.title || caption || description.slice(0, 80)).trim();
+          const allowedTypes: VisualType[] = ['image', 'figure', 'diagram', 'chart', 'graph', 'table', 'flowchart', 'illustration', 'map', 'screenshot', 'other'];
+          const type = allowedTypes.includes(visual.type as VisualType) ? visual.type as VisualType : 'other';
+          return [{
+            id: `${documentId}_p${pageNumber}_v${visualIndex + 1}`,
+            documentId,
+            pageNumber,
+            type,
+            title,
+            caption,
+            description,
+            imageData: `data:image/jpeg;base64,${visualImageBase64}`,
+            embedding: [],
+          }];
+        });
+        document.visualAnalyzedPages = [...new Set([...document.visualAnalyzedPages, pageNumber])];
+        document.visuals = [...document.visuals.filter((visual) => visual.pageNumber !== pageNumber), ...visuals];
+      } finally {
+        page.cleanup();
+      }
+    });
 
     const pendingVisualEmbeddings = document.visuals.filter((visual) => !visual.embedding.length);
     stage = 'visual embedding';
-    console.log(`[INDEX] Visual embedding started: count=${pendingVisualEmbeddings.length}`);
+    console.log(`[EMBEDDING] Visual embedding started: count=${pendingVisualEmbeddings.length}`);
     const visualEmbeddings = await embedTexts(ai, pendingVisualEmbeddings.map((visual) => `${visual.title}. ${visual.caption}. ${visual.description}`), visualAbortSignal);
     pendingVisualEmbeddings.forEach((visual, index) => {
       visual.embedding = visualEmbeddings[index];
@@ -580,9 +634,21 @@ async function indexDocumentVisuals(documentId: string, prepared?: PreparedPdf):
     document.visualIndexReady = true;
     document.visualIndexStatus = 'ready';
     document.visualIndexError = undefined;
-    console.log(`[INDEX] Visual indexing complete: documentId=${documentId} visuals=${document.visuals.length} elapsedMs=${Date.now() - visualStarted}`);
+    documentCache.set(documentId, document);
+
+    if (isSupabaseConfigured()) {
+      await saveVisualsToDb(document.visuals);
+      await updateDocumentStatusInDb(documentId, {
+        visualIndexReady: true,
+        visualIndexStatus: 'ready',
+        visualAnalyzedPages: document.visualAnalyzedPages,
+        visualIndexError: undefined,
+      });
+    }
+
+    console.log(`[VISUAL INDEXING] Visual indexing complete: documentId=${documentId} visuals=${document.visuals.length} elapsedMs=${Date.now() - visualStarted}`);
   } catch (error) {
-    logIndexError(document, stage, error, true);
+    await logIndexError(document, stage, error, true);
   } finally {
     try {
       await loadingTask?.destroy();
@@ -594,7 +660,7 @@ async function indexDocumentVisuals(documentId: string, prepared?: PreparedPdf):
 }
 
 async function indexStoredDocument(documentId: string, prepared?: PreparedPdf): Promise<void> {
-  const document = documentStore.get(documentId);
+  const document = await getDocument(documentId);
   if (!document || document.textIndexReady || activeTextIndexJobs.has(documentId)) {
     try {
       await prepared?.loadingTask.destroy();
@@ -607,12 +673,20 @@ async function indexStoredDocument(documentId: string, prepared?: PreparedPdf): 
   const textJob = indexDocumentText(documentId);
   const visualJob = indexDocumentVisuals(documentId, prepared);
   void visualJob.catch((error) => {
-    logIndexError(document, 'visual worker promise', error, true);
+    void logIndexError(document, 'visual worker promise', error, true);
   });
   await textJob;
 }
 
-function initializeSamples() {
+async function initializeSamples() {
+  if (isSupabaseConfigured()) {
+    try {
+      await ensureDocumentsBucketExists();
+    } catch (err: any) {
+      console.warn(`[SUPABASE] Storage bucket initialization check: ${err.message}`);
+    }
+  }
+
   for (const sample of SAMPLE_DOCUMENTS) {
     const rawText = sample.description + ' ' + (sample.suggestedQuestions || []).join(' ');
     const chunks = chunkText(rawText).map((item, index): Chunk => ({
@@ -622,7 +696,7 @@ function initializeSamples() {
       pageNumber: item.pageNumber,
       text: item.text,
     }));
-    documentStore.set(sample.id, {
+    const sampleDoc: StoredDoc = {
       id: sample.id,
       userId: 'default_user',
       name: sample.name,
@@ -643,20 +717,27 @@ function initializeSamples() {
       visualIndexStatus: 'ready',
       indexedChunks: 0,
       uploadedAt: Date.now(),
-    });
+    };
+    documentCache.set(sample.id, sampleDoc);
+
+    if (isSupabaseConfigured()) {
+      void upsertDocumentToDb(sampleDoc).catch((e) => {
+        console.warn(`[SUPABASE] Notice syncing sample ${sample.id}: ${e.message}`);
+      });
+    }
   }
 }
 
 async function indexSampleDocument(documentId: string): Promise<void> {
-  const document = documentStore.get(documentId);
+  const document = await getDocument(documentId);
   if (!document) return;
   await indexStoredDocument(documentId);
 }
 
-function retrieveRelevantChunks(queryEmbedding: number[], documentId: string, userId: string = 'default_user', topK: number = 5) {
-  const doc = documentStore.get(documentId);
-  const candidateChunks = doc && (!doc.userId || doc.userId === userId)
-    ? doc.chunks.filter((chunk) => chunk.documentId === documentId)
+function retrieveRelevantChunks(queryEmbedding: number[], document: StoredDoc, userId: string = 'default_user', topK: number = 5) {
+  const documentId = document.id;
+  const candidateChunks = (!document.userId || document.userId === userId)
+    ? document.chunks.filter((chunk) => chunk.documentId === documentId)
     : [];
   const scoredChunks = candidateChunks.map((chunk) => {
     const similarity = chunk.embedding ? cosineSimilarity(queryEmbedding, chunk.embedding) : 0;
@@ -800,18 +881,17 @@ function getVisualConceptConflict(questionTerms: Set<string>, visualTerms: Set<s
 
 function retrieveRelevantVisuals(
   queryEmbedding: number[],
-  documentId: string,
+  document: StoredDoc,
   userId: string,
   question: string,
   visualContext: string,
   relevantPages: Set<number>,
 ): StoredVisual[] {
-  const doc = documentStore.get(documentId);
-  if (!doc || !doc.visualIndexReady || (doc.userId && doc.userId !== userId)) return [];
+  const documentId = document.id;
+  if (!document.visualIndexReady || (document.userId && document.userId !== userId)) return [];
 
   const questionTerms = getVisualConceptTerms(question);
   const contextTerms = getVisualConceptTerms(visualContext);
-  const queryTerms = new Set([...questionTerms, ...contextTerms]);
   const figureReference = question.match(/\b(fig(?:ure)?|table|diagram|chart|graph)\s*(?:no\.?\s*)?(\d+)\b/i);
   const referencePattern = figureReference
     ? new RegExp(`\\b(?:fig(?:ure)?|table|diagram|chart|graph)\\s*(?:no\\.?\\s*)?${figureReference[2]}\\b`, 'i')
@@ -830,7 +910,7 @@ function retrieveRelevantVisuals(
           : [];
 
   console.log(`[VISUAL QUERY] documentId=${documentId} question="${question.slice(0, 240)}" context="${visualContext.slice(0, 650)}"`);
-  const candidates = doc.visuals
+  const candidates = document.visuals
     .filter((visual) => visual.documentId === documentId && visual.embedding.length > 0)
     .map((visual) => {
       const semantic = cosineSimilarity(queryEmbedding, visual.embedding);
@@ -907,31 +987,53 @@ function retrieveRelevantVisuals(
 }
 
 // API Endpoints
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', documentsLoaded: documentStore.size });
+app.get('/api/health', async (_req, res) => {
+  res.json({
+    status: 'ok',
+    documentsLoaded: documentCache.size,
+    supabaseConfigured: isSupabaseConfigured(),
+  });
 });
 
-app.get('/api/documents', (req, res) => {
+app.get('/api/documents', async (req, res) => {
   const userId = (req.query.userId as string) || 'default_user';
-  const docs = Array.from(documentStore.values())
-    .filter((doc) => !doc.userId || doc.userId === userId)
-    .map((doc) => ({
-      id: doc.id,
-      name: doc.name,
-      size: doc.size,
-      pageCount: doc.pageCount,
-      summary: doc.summary,
-      suggestedQuestions: doc.suggestedQuestions,
-      uploadedAt: doc.uploadedAt,
-      indexingStatus: doc.indexingStatus,
-      textIndexReady: doc.textIndexReady,
-      visualIndexReady: doc.visualIndexReady,
-      visualIndexStatus: doc.visualIndexStatus,
-      indexingError: doc.indexingError,
-      visualIndexError: doc.visualIndexError,
-      indexedChunks: doc.indexedChunks,
-    }));
-  res.json({ documents: docs });
+  let docs: StoredDoc[] = [];
+
+  if (isSupabaseConfigured()) {
+    try {
+      const dbDocs = await listDocumentsFromDb(userId);
+      const dbMap = new Map(dbDocs.map((d) => [d.id, d]));
+      for (const [id, doc] of documentCache.entries()) {
+        if (!dbMap.has(id) && (!doc.userId || doc.userId === userId)) {
+          dbMap.set(id, doc);
+        }
+      }
+      docs = Array.from(dbMap.values());
+    } catch (err: any) {
+      console.error(`[SUPABASE] Failed to list documents: ${err.message}`);
+      docs = Array.from(documentCache.values()).filter((doc) => !doc.userId || doc.userId === userId);
+    }
+  } else {
+    docs = Array.from(documentCache.values()).filter((doc) => !doc.userId || doc.userId === userId);
+  }
+
+  const mapped = docs.map((doc) => ({
+    id: doc.id,
+    name: doc.name,
+    size: doc.size,
+    pageCount: doc.pageCount,
+    summary: doc.summary,
+    suggestedQuestions: doc.suggestedQuestions,
+    uploadedAt: doc.uploadedAt,
+    indexingStatus: doc.indexingStatus,
+    textIndexReady: doc.textIndexReady,
+    visualIndexReady: doc.visualIndexReady,
+    visualIndexStatus: doc.visualIndexStatus,
+    indexingError: doc.indexingError,
+    visualIndexError: doc.visualIndexError,
+    indexedChunks: doc.indexedChunks,
+  }));
+  res.json({ documents: mapped });
 });
 
 app.get('/api/samples', (_req, res) => {
@@ -946,12 +1048,22 @@ app.get('/api/samples', (_req, res) => {
   res.json({ samples });
 });
 
-app.get('/api/documents/:id/status', (req, res) => {
-  const document = documentStore.get(req.params.id);
+app.get('/api/documents/:id/status', async (req, res) => {
+  const document = await getDocument(req.params.id);
   if (!document) {
     res.status(404).json({ error: 'Document not found' });
     return;
   }
+
+  // Safe serverless resumption: if indexing is queued and serverless runtime, advance indexing
+  if (isServerlessRuntime && document.indexingStatus === 'queued' && !activeTextIndexJobs.has(document.id)) {
+    try {
+      await indexStoredDocument(document.id);
+    } catch (err: any) {
+      console.warn(`[INDEXING] Serverless status resumption notice: ${err.message}`);
+    }
+  }
+
   res.json({
     documentId: document.id,
     status: document.indexingStatus,
@@ -965,12 +1077,23 @@ app.get('/api/documents/:id/status', (req, res) => {
   });
 });
 
-app.get('/api/documents/:id', (req, res) => {
-  const doc = documentStore.get(req.params.id);
+app.get('/api/documents/:id', async (req, res) => {
+  const doc = await getDocument(req.params.id);
   if (!doc) {
     res.status(404).json({ error: 'Document not found' });
     return;
   }
+
+  let pdfBase64 = doc.base64;
+  if (!pdfBase64 && doc.storagePath && isSupabaseConfigured()) {
+    const downloaded = await downloadPdfFromSupabaseStorage(doc.storagePath);
+    if (downloaded) {
+      pdfBase64 = downloaded.toString('base64');
+      doc.base64 = pdfBase64;
+      documentCache.set(doc.id, doc);
+    }
+  }
+
   res.json({
     id: doc.id,
     name: doc.name,
@@ -985,8 +1108,30 @@ app.get('/api/documents/:id', (req, res) => {
     visualIndexStatus: doc.visualIndexStatus,
     indexingError: doc.indexingError,
     visualIndexError: doc.visualIndexError,
-    base64: `data:application/pdf;base64,${doc.base64}`,
+    base64: pdfBase64 ? `data:application/pdf;base64,${pdfBase64}` : '',
   });
+});
+
+app.get('/api/documents/:id/chat', async (req, res) => {
+  const userId = (req.query.userId as string) || 'default_user';
+  const documentId = req.params.id;
+  try {
+    const messages = await getChatMessages(documentId, userId);
+    res.json({ messages });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/documents/:id/chat', async (req, res) => {
+  const userId = (req.query.userId as string) || 'default_user';
+  const documentId = req.params.id;
+  try {
+    await clearChatMessages(documentId, userId);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/documents/analyze', express.raw({ type: 'application/pdf', limit: '50mb' }), async (req, res) => {
@@ -1011,9 +1156,17 @@ app.post('/api/documents/analyze', express.raw({ type: 'application/pdf', limit:
     const uploadedBytes = rawUpload || Buffer.from(cleanBase64, 'base64');
     const contentHash = createHash('sha256').update(uploadedBytes).digest('hex');
     const currentUserId = body.userId || 'default_user';
-    const existing = Array.from(documentStore.values()).find((doc) =>
-      doc.contentHash === contentHash && (!doc.userId || doc.userId === currentUserId),
-    );
+
+    let existing: StoredDoc | null = null;
+    if (isSupabaseConfigured()) {
+      existing = await findDocumentByContentHash(contentHash, currentUserId);
+    }
+    if (!existing) {
+      existing = Array.from(documentCache.values()).find((doc) =>
+        doc.contentHash === contentHash && (!doc.userId || doc.userId === currentUserId),
+      ) || null;
+    }
+
     if (existing) {
       res.json({
         id: existing.id,
@@ -1030,19 +1183,28 @@ app.post('/api/documents/analyze', express.raw({ type: 'application/pdf', limit:
         indexingError: existing.indexingError,
         visualIndexError: existing.visualIndexError,
       });
-      console.log(`[UPLOAD] documentId=${existing.id} duplicate=true elapsedMs=${Date.now() - uploadStarted}`);
+      console.log(`[DOCUMENT UPLOAD] documentId=${existing.id} duplicate=true elapsedMs=${Date.now() - uploadStarted}`);
       return;
     }
+
     do {
       documentId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    } while (documentStore.has(documentId));
+    } while (documentCache.has(documentId));
     const displayName = name.trim() || 'Uploaded PDF';
     const uploadedAt = Date.now();
+
+    let storagePath: string | undefined;
+    if (isSupabaseConfigured()) {
+      const uploadedStoragePath = await uploadPdfToSupabaseStorage(documentId, displayName, uploadedBytes);
+      if (uploadedStoragePath) storagePath = uploadedStoragePath;
+    }
+
     const document: StoredDoc = {
       id: documentId,
       userId: currentUserId,
       name: displayName,
       base64: cleanBase64,
+      storagePath,
       size: rawUpload?.length || Number(body.size) || uploadedBytes.length,
       pageCount: 0,
       summary: 'Extracting document text locally.',
@@ -1060,8 +1222,12 @@ app.post('/api/documents/analyze', express.raw({ type: 'application/pdf', limit:
       indexedChunks: 0,
       uploadedAt,
     };
-    documentStore.set(documentId, document);
-    console.log(`[UPLOAD] documentId=${documentId} name=${displayName} size=${document.size} registered=true`);
+    documentCache.set(documentId, document);
+    console.log(`[DOCUMENT UPLOAD] documentId=${documentId} name=${displayName} size=${document.size} registered=true`);
+
+    if (isSupabaseConfigured()) {
+      await upsertDocumentToDb(document, storagePath);
+    }
 
     try {
       prepared = await extractPdfLocally(cleanBase64, documentId, currentUserId);
@@ -1078,11 +1244,33 @@ app.post('/api/documents/analyze', express.raw({ type: 'application/pdf', limit:
       console.log(`[INDEX] Pages: ${document.pageCount}`);
       console.log(`[INDEX] Chunks created: ${document.chunks.length}`);
       document.indexingStatus = 'queued';
+      documentCache.set(documentId, document);
+
+      if (isSupabaseConfigured()) {
+        await saveChunksToDb(document.chunks);
+        await updateDocumentStatusInDb(documentId, {
+          pageCount: document.pageCount,
+          summary: document.summary,
+          pagesText: document.pagesText,
+          visualCandidatePages: document.visualCandidatePages,
+          visualAnalyzedPages: [],
+          visualIndexReady: document.visualIndexReady,
+          visualIndexStatus: document.visualIndexStatus,
+          indexingStatus: 'queued',
+        });
+      }
     } catch (error: any) {
       document.indexingStatus = 'error';
       document.textIndexReady = false;
       document.indexingError = String(error?.message || error);
       console.error(`[PDF EXTRACTION] documentId=${documentId} error=${document.indexingError}`);
+      if (isSupabaseConfigured()) {
+        await updateDocumentStatusInDb(documentId, {
+          indexingStatus: 'error',
+          textIndexReady: false,
+          indexingError: document.indexingError,
+        });
+      }
     }
 
     res.status(202).json({
@@ -1100,18 +1288,19 @@ app.post('/api/documents/analyze', express.raw({ type: 'application/pdf', limit:
       indexingError: document.indexingError,
       visualIndexError: document.visualIndexError,
     });
-    console.log(`[UPLOAD] documentId=${documentId} status=${document.indexingStatus} elapsedMs=${Date.now() - uploadStarted}`);
+    console.log(`[DOCUMENT UPLOAD] documentId=${documentId} status=${document.indexingStatus} elapsedMs=${Date.now() - uploadStarted}`);
+
     if (prepared) {
       setImmediate(() => {
         void indexStoredDocument(documentId, prepared).catch((error) => {
-          const failedDocument = documentStore.get(documentId);
-          if (failedDocument) logIndexError(failedDocument, 'background worker promise', error);
+          const failedDocument = documentCache.get(documentId);
+          if (failedDocument) void logIndexError(failedDocument, 'background worker promise', error);
         });
       });
     }
   } catch (err: any) {
     if (documentId) {
-      const document = documentStore.get(documentId);
+      const document = documentCache.get(documentId);
       if (document) {
         document.indexingStatus = 'error';
         document.textIndexReady = false;
@@ -1119,12 +1308,12 @@ app.post('/api/documents/analyze', express.raw({ type: 'application/pdf', limit:
       }
     }
     res.status(500).json({ error: err.message });
-    console.error(`[UPLOAD] error elapsedMs=${Date.now() - uploadStarted}:`, err);
+    console.error(`[DOCUMENT UPLOAD] error elapsedMs=${Date.now() - uploadStarted}:`, err);
   }
 });
 
-const reindexDocument: express.RequestHandler = (req, res) => {
-  const document = documentStore.get(req.params.id);
+const reindexDocument: express.RequestHandler = async (req, res) => {
+  const document = await getDocument(req.params.id);
   if (!document) {
     res.status(404).json({ error: 'Document not found' });
     return;
@@ -1145,16 +1334,44 @@ const reindexDocument: express.RequestHandler = (req, res) => {
   document.pagesText = [];
   document.visualCandidatePages = [];
   document.visualAnalyzedPages = [];
+  documentCache.set(document.id, document);
+
+  if (isSupabaseConfigured()) {
+    await updateDocumentStatusInDb(document.id, {
+      indexingStatus: 'queued',
+      textIndexReady: false,
+      visualIndexReady: false,
+      visualIndexStatus: 'queued',
+      indexedChunks: 0,
+      indexingError: undefined,
+      visualIndexError: undefined,
+      pagesText: [],
+      visualCandidatePages: [],
+      visualAnalyzedPages: [],
+    });
+  }
+
   res.status(202).json({
     id: document.id,
     indexingStatus: document.indexingStatus,
     textIndexReady: document.textIndexReady,
     visualIndexReady: document.visualIndexReady,
   });
-  setImmediate(async () => {
+
+  const performReindex = async () => {
     let prepared: PreparedPdf | undefined;
     try {
-      prepared = await extractPdfLocally(document.base64, document.id, document.userId || 'default_user');
+      let pdfBase64 = document.base64;
+      if (!pdfBase64 && document.storagePath && isSupabaseConfigured()) {
+        const buf = await downloadPdfFromSupabaseStorage(document.storagePath);
+        if (buf) {
+          pdfBase64 = buf.toString('base64');
+          document.base64 = pdfBase64;
+        }
+      }
+      if (!pdfBase64) throw new Error('Cannot load PDF content for re-indexing.');
+
+      prepared = await extractPdfLocally(pdfBase64, document.id, document.userId || 'default_user');
       document.pageCount = prepared.pageCount;
       document.pagesText = prepared.pagesText;
       document.chunks = prepared.chunks;
@@ -1163,9 +1380,23 @@ const reindexDocument: express.RequestHandler = (req, res) => {
       document.summary = text.slice(0, 500) || 'No selectable text was found in this PDF.';
       document.visualIndexReady = prepared.visualCandidatePages.length === 0;
       document.visualIndexStatus = document.visualIndexReady ? 'ready' : 'queued';
+      documentCache.set(document.id, document);
+
+      if (isSupabaseConfigured()) {
+        await saveChunksToDb(document.chunks);
+        await updateDocumentStatusInDb(document.id, {
+          pageCount: document.pageCount,
+          summary: document.summary,
+          pagesText: document.pagesText,
+          visualCandidatePages: document.visualCandidatePages,
+          visualIndexReady: document.visualIndexReady,
+          visualIndexStatus: document.visualIndexStatus,
+        });
+      }
+
       await indexStoredDocument(document.id, prepared);
     } catch (error: any) {
-      logIndexError(document, 'reindex PDF extraction', error);
+      await logIndexError(document, 'reindex PDF extraction', error);
       if (prepared) {
         try {
           await prepared.loadingTask.destroy();
@@ -1174,7 +1405,13 @@ const reindexDocument: express.RequestHandler = (req, res) => {
         }
       }
     }
-  });
+  };
+
+  if (isServerlessRuntime) {
+    void performReindex();
+  } else {
+    setImmediate(() => { void performReindex(); });
+  }
 };
 
 app.post('/api/documents/:id/reindex', reindexDocument);
@@ -1192,12 +1429,15 @@ app.post('/api/chat', async (req, res) => {
 
     const currentUserId = userId || 'default_user';
     const selectedDocumentId = typeof documentId === 'string' ? documentId : '';
-    const selectedDocument = documentStore.get(selectedDocumentId);
+    const selectedDocument = await getDocument(selectedDocumentId);
     if (!selectedDocument || (selectedDocument.userId && selectedDocument.userId !== currentUserId)) {
       res.status(404).json({ error: 'Document not found.' });
       console.log(`[TOTAL RESPONSE] documentId=${selectedDocumentId} elapsedMs=${Date.now() - totalStarted} error=document-not-found`);
       return;
     }
+
+    console.log(`[CHAT] documentId=${selectedDocumentId} question="${question.trim().slice(0, 100)}"`);
+
     if (!selectedDocument.textIndexReady) {
       const error = selectedDocument.indexingStatus === 'error'
         ? `Document text indexing failed: ${selectedDocument.indexingError || 'unknown error'}`
@@ -1227,7 +1467,9 @@ app.post('/api/chat', async (req, res) => {
       return;
     }
 
-    const retrieval = retrieveRelevantChunks(queryEmbedding, selectedDocumentId, currentUserId, 5);
+    const retrieval = retrieveRelevantChunks(queryEmbedding, selectedDocument, currentUserId, 5);
+    console.log(`[TEXT RETRIEVAL] documentId=${selectedDocumentId} chunks=${retrieval.results.length} elapsedMs=${Date.now() - retrievalStarted}`);
+
     const visualContext = [
       ...relevantConversation.map((item: any) => `${item.role}: ${item.text.slice(0, 300)}`),
       ...retrieval.results.slice(0, 1).map((chunk) => chunk.text.slice(0, 600)),
@@ -1240,7 +1482,7 @@ app.post('/api/chat', async (req, res) => {
         if (visualQueryEmbedding.length > 0) {
           relatedVisuals = retrieveRelevantVisuals(
             visualQueryEmbedding,
-            selectedDocumentId,
+            selectedDocument,
             currentUserId,
             question,
             visualContext,
@@ -1251,6 +1493,7 @@ app.post('/api/chat', async (req, res) => {
         console.error(`[VISUAL QUERY ERROR]\ndocumentId: ${selectedDocumentId}\nstage: visual context embedding\nerror: ${String((error as Error)?.message || error)}`);
       }
     }
+    console.log(`[VISUAL RETRIEVAL] documentId=${selectedDocumentId} visuals=${relatedVisuals.length}`);
     console.log(`[RAG RETRIEVAL] documentId=${selectedDocumentId} chunks=${retrieval.results.length} visuals=${relatedVisuals.length} elapsedMs=${Date.now() - retrievalStarted}`);
     if (!retrieval.hasRelevantResults && relatedVisuals.length === 0) {
       res.json({
@@ -1319,14 +1562,40 @@ app.post('/api/chat', async (req, res) => {
     console.log(`[LLM] documentId=${selectedDocumentId} elapsedMs=${Date.now() - llmStarted}`);
 
     const parsed = JSON.parse(response.text || '{}');
+    const answer = parsed.answer || 'Answer generated from vector retrieval.';
+    const finalPageNumbers = pageNumbers.length > 0 ? pageNumbers : parsed.pageNumbers || [1];
+    const isFoundInDocument = parsed.isFoundInDocument !== false;
+    const topic = parsed.topic || '';
+    const suggestedFollowUps = parsed.suggestedFollowUps || [];
+    const formattedVisuals = relatedVisuals.map(({ embedding: _embedding, ...visual }) => visual);
+
+    // Persist conversation and messages in Supabase
+    if (isSupabaseConfigured()) {
+      void saveChatMessage(selectedDocumentId, {
+        role: 'user',
+        text: question.trim(),
+      }, currentUserId).catch((e) => console.error(`[SUPABASE] Failed to save user message: ${e.message}`));
+
+      void saveChatMessage(selectedDocumentId, {
+        role: 'assistant',
+        text: answer,
+        pageNumbers: finalPageNumbers,
+        relevantExcerpt,
+        isFoundInDocument,
+        topic,
+        suggestedFollowUps,
+        relatedVisuals: formattedVisuals,
+      }, currentUserId).catch((e) => console.error(`[SUPABASE] Failed to save assistant message: ${e.message}`));
+    }
+
     res.json({
-      answer: parsed.answer || 'Answer generated from vector retrieval.',
-      pageNumbers: pageNumbers.length > 0 ? pageNumbers : parsed.pageNumbers || [1],
+      answer,
+      pageNumbers: finalPageNumbers,
       relevantExcerpt,
-      isFoundInDocument: parsed.isFoundInDocument !== false,
-      topic: parsed.topic || '',
-      suggestedFollowUps: parsed.suggestedFollowUps || [],
-      relatedVisuals: relatedVisuals.map(({ embedding: _embedding, ...visual }) => visual),
+      isFoundInDocument,
+      topic,
+      suggestedFollowUps,
+      relatedVisuals: formattedVisuals,
     });
     console.log(`[TOTAL RESPONSE] documentId=${selectedDocumentId} elapsedMs=${Date.now() - totalStarted}`);
   } catch (err: any) {
@@ -1335,39 +1604,41 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// Vite middleware or static serving
-if (process.env.NODE_ENV !== 'production') {
+initializeSamples();
+
+if (!isServerlessRuntime && process.env.NODE_ENV !== 'production') {
   const { createServer } = await import('vite');
   const vite = await createServer({ server: { middlewareMode: true }, appType: 'spa' });
   app.use(vite.middlewares);
-} else {
+} else if (!isServerlessRuntime) {
   app.use(express.static(path.resolve(__dirname, 'dist')));
   app.get('*', (_req, res) => res.sendFile(path.resolve(__dirname, 'dist/index.html')));
 }
 
 // Guaranteed Server Startup Runner
-async function startServer() {
-  try {
-    console.log('Registering sample documents...');
-    initializeSamples();
-  } catch (err) {
-    console.warn('Warning during sample initialization:', err);
+function startSampleIndexing() {
+  for (const sample of SAMPLE_DOCUMENTS) {
+    setImmediate(() => {
+      void indexSampleDocument(sample.id).catch((error) => {
+        const document = documentCache.get(sample.id);
+        if (document) void logIndexError(document, 'sample background promise', error);
+      });
+    });
   }
+}
 
+async function startServer() {
   app.listen(port, '0.0.0.0', () => {
     console.log(`Server running at http://localhost:${port}`);
-    for (const sample of SAMPLE_DOCUMENTS) {
-      setImmediate(() => {
-        void indexSampleDocument(sample.id).catch((error) => {
-          const document = documentStore.get(sample.id);
-          if (document) logIndexError(document, 'sample background promise', error);
-        });
-      });
-    }
+    startSampleIndexing();
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (isServerlessRuntime) {
+  startSampleIndexing();
+} else {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
