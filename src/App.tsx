@@ -3,12 +3,27 @@ import { Navbar } from './components/Navbar.tsx';
 import { ChatArea } from './components/ChatArea.tsx';
 import { PdfViewer } from './components/PdfViewer.tsx';
 import { UploadModal } from './components/UploadModal.tsx';
-import { DocumentInfo, ChatMessage, SampleDocumentItem } from './types.ts';
+import { DocumentInfo, ChatMessage, SampleDocumentItem, RelatedVisual } from './types.ts';
 import { base64ToBlobUrl } from './utils/formatters.ts';
 
 export default function App() {
-  const [document, setDocument] = useState<DocumentInfo | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [documents, setDocuments] = useState<DocumentInfo[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('neuroquery-documents') || '[]');
+    } catch {
+      return [];
+    }
+  });
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(() => localStorage.getItem('neuroquery-selected-document'));
+  const [conversations, setConversations] = useState<Record<string, ChatMessage[]>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('neuroquery-conversations') || '{}');
+    } catch {
+      return {};
+    }
+  });
+  const document = documents.find((item) => item.id === selectedDocumentId) || null;
+  const messages = document ? conversations[document.id] || [] : [];
   const [samples, setSamples] = useState<SampleDocumentItem[]>([]);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -19,55 +34,43 @@ export default function App() {
   const [highlightExcerpt, setHighlightExcerpt] = useState<string | null>(null);
   const [isPdfPanelOpen, setIsPdfPanelOpen] = useState(true);
 
-  // 1. Fetch available sample documents on mount
-  useEffect(() => {
-    async function loadSamples() {
-      try {
-        const res = await fetch('/api/samples');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.samples && data.samples.length > 0) {
-            setSamples(data.samples);
-            // Pre-load the first sample so the app is immediately testable
-            await selectSample(data.samples[0].id, false);
-          }
-        }
-      } catch (err) {
-        console.error('Failed to load sample documents:', err);
-      }
-    }
-    loadSamples();
-  }, []);
-
-  // 2. Select a sample document
-  const selectSample = async (sampleId: string, openModalOnFail = true) => {
+  const selectDocument = async (documentId: string, openModalOnFail = true) => {
     try {
       setIsAnalyzingDoc(true);
-      setLoadingMessage('Loading sample PDF document...');
-      const res = await fetch(`/api/documents/${sampleId}`);
-      if (!res.ok) throw new Error('Could not load sample document');
+      setLoadingMessage('Loading PDF document...');
+      const existing = documents.find((item) => item.id === documentId);
+      let selected = existing;
+      if (!selected?.blobUrl) {
+        const res = await fetch(`/api/documents/${documentId}`);
+        if (!res.ok) throw new Error('Could not load PDF document');
+        const data = await res.json();
+        selected = {
+          ...existing,
+          id: data.id,
+          name: data.name,
+          size: data.size,
+          pageCount: data.pageCount,
+          summary: data.summary,
+          suggestedQuestions: data.suggestedQuestions,
+          uploadedAt: data.uploadedAt,
+          indexingStatus: data.indexingStatus,
+          textIndexReady: data.textIndexReady,
+          visualIndexReady: data.visualIndexReady,
+          visualIndexStatus: data.visualIndexStatus,
+          indexingError: data.indexingError,
+          visualIndexError: data.visualIndexError,
+          blobUrl: base64ToBlobUrl(data.base64),
+        };
+        setDocuments((previous) => previous.map((item) => item.id === documentId ? selected! : item));
+      }
 
-      const data = await res.json();
-      const blobUrl = base64ToBlobUrl(data.base64);
-
-      setDocument({
-        id: data.id,
-        name: data.name,
-        size: data.size,
-        pageCount: data.pageCount,
-        summary: data.summary,
-        suggestedQuestions: data.suggestedQuestions,
-        base64: data.base64,
-        blobUrl,
-      });
-
-      setMessages([]);
+      setSelectedDocumentId(documentId);
       setTargetPage(1);
       setHighlightExcerpt(null);
       setIsPdfPanelOpen(true);
       setIsUploadModalOpen(false);
     } catch (err) {
-      console.error('Error selecting sample:', err);
+      console.error('Error selecting document:', err);
       if (openModalOnFail) setIsUploadModalOpen(true);
     } finally {
       setIsAnalyzingDoc(false);
@@ -75,28 +78,125 @@ export default function App() {
     }
   };
 
-  // 3. Upload custom user PDF
+  const selectSample = (sampleId: string) => selectDocument(sampleId);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadLibrary() {
+      try {
+        const [documentsResponse, samplesResponse] = await Promise.all([
+          fetch('/api/documents'),
+          fetch('/api/samples'),
+        ]);
+        const availableDocuments = documentsResponse.ok
+          ? (await documentsResponse.json()).documents as DocumentInfo[]
+          : [];
+        if (samplesResponse.ok) {
+          const data = await samplesResponse.json();
+          if (!cancelled) setSamples(data.samples || []);
+        }
+        if (cancelled) return;
+
+        let storedDocuments: DocumentInfo[] = [];
+        try {
+          storedDocuments = JSON.parse(localStorage.getItem('neuroquery-documents') || '[]');
+        } catch {
+          storedDocuments = [];
+        }
+        const storedById = new Map(storedDocuments.map((item) => [item.id, item]));
+        const library = availableDocuments.map((item) => ({ ...storedById.get(item.id), ...item }));
+        setDocuments(library);
+
+        const storedSelection = localStorage.getItem('neuroquery-selected-document');
+        const nextDocumentId = library.some((item) => item.id === storedSelection)
+          ? storedSelection
+          : library[0]?.id || null;
+        if (nextDocumentId) await selectDocument(nextDocumentId, false);
+      } catch (err) {
+        console.error('Failed to load document library:', err);
+      }
+    }
+    loadLibrary();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('neuroquery-documents', JSON.stringify(documents.map(({ blobUrl: _blobUrl, base64: _base64, ...item }) => item)));
+  }, [documents]);
+
+  useEffect(() => {
+    localStorage.setItem('neuroquery-selected-document', selectedDocumentId || '');
+  }, [selectedDocumentId]);
+
+  useEffect(() => {
+    localStorage.setItem('neuroquery-conversations', JSON.stringify(conversations));
+  }, [conversations]);
+
+  useEffect(() => {
+    const needsStatusPolling = (item: DocumentInfo) => {
+      if (!item.textIndexReady) return item.indexingStatus !== 'error';
+      return !item.visualIndexReady && item.visualIndexStatus !== 'error';
+    };
+    if (!documents.some(needsStatusPolling)) return;
+    let requestInProgress = false;
+    const refreshIndexingStatus = async () => {
+      if (requestInProgress) return;
+      requestInProgress = true;
+      try {
+        const pendingDocuments = documents.filter(needsStatusPolling);
+        const statuses = await Promise.all(pendingDocuments.map(async (item) => {
+          const response = await fetch(`/api/documents/${item.id}/status`);
+          if (!response.ok) return null;
+          return await response.json();
+        }));
+        const statusById = new Map(statuses.filter(Boolean).map((status) => [status.documentId, status]));
+        setDocuments((previous) => {
+          let changed = false;
+          const refreshed = previous.map((item) => {
+            const status = statusById.get(item.id);
+            if (!status) return item;
+            if (item.indexingStatus === status.status
+              && item.textIndexReady === status.textIndexReady
+              && item.visualIndexReady === status.visualIndexReady
+              && item.visualIndexStatus === status.visualIndexStatus
+              && item.indexingError === status.error
+              && item.visualIndexError === status.visualIndexError) return item;
+            changed = true;
+            return {
+              ...item,
+              indexingStatus: status.status,
+              textIndexReady: status.textIndexReady,
+              visualIndexReady: status.visualIndexReady,
+              visualIndexStatus: status.visualIndexStatus,
+              indexingError: status.error,
+              visualIndexError: status.visualIndexError,
+            };
+          });
+          return changed ? refreshed : previous;
+        });
+      } catch (err) {
+        console.error('Failed to refresh document indexing status:', err);
+      } finally {
+        requestInProgress = false;
+      }
+    };
+    const timer = window.setInterval(() => { void refreshIndexingStatus(); }, 1500);
+    return () => window.clearInterval(timer);
+  }, [documents]);
+
+  // Upload custom user PDF and append it to the existing library.
   const handleUploadCustomFile = async (file: File) => {
     setIsAnalyzingDoc(true);
-    setLoadingMessage(`Analyzing ${file.name} with Gemini AI...`);
+    setLoadingMessage(`Uploading ${file.name} and extracting text locally...`);
 
     try {
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve, reject) => {
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = (err) => reject(err);
-      });
-      reader.readAsDataURL(file);
-      const dataUrl = await base64Promise;
-
       const res = await fetch('/api/documents/analyze', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: file.name,
-          base64: dataUrl,
-          size: file.size,
-        }),
+        headers: {
+          'Content-Type': 'application/pdf',
+          'X-File-Name': encodeURIComponent(file.name),
+        },
+        body: file,
       });
 
       if (!res.ok) {
@@ -107,18 +207,25 @@ export default function App() {
       const analyzed = await res.json();
       const blobUrl = URL.createObjectURL(file);
 
-      setDocument({
+      const newDocument: DocumentInfo = {
         id: analyzed.id,
-        name: analyzed.name || file.name,
+        name: file.name,
         size: analyzed.size || file.size,
-        pageCount: analyzed.pageCount || 1,
+        pageCount: analyzed.pageCount ?? 0,
         summary: analyzed.summary || '',
         suggestedQuestions: analyzed.suggestedQuestions || [],
-        base64: dataUrl,
         blobUrl,
-      });
+        uploadedAt: analyzed.uploadedAt || Date.now(),
+        indexingStatus: analyzed.indexingStatus || 'processing',
+        textIndexReady: analyzed.textIndexReady || false,
+        visualIndexReady: analyzed.visualIndexReady || false,
+        visualIndexStatus: analyzed.visualIndexStatus || 'queued',
+        indexingError: analyzed.indexingError,
+        visualIndexError: analyzed.visualIndexError,
+      };
 
-      setMessages([]);
+      setDocuments((previous) => [...previous.filter((item) => item.id !== newDocument.id), newDocument]);
+      setSelectedDocumentId(newDocument.id);
       setTargetPage(1);
       setHighlightExcerpt(null);
       setIsPdfPanelOpen(true);
@@ -133,9 +240,22 @@ export default function App() {
     }
   };
 
+  const handleRetryIndexing = async (documentId: string) => {
+    const response = await fetch(`/api/documents/${documentId}/reindex`, { method: 'POST' });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || 'Could not retry document indexing.');
+    }
+    setDocuments((previous) => previous.map((item) => item.id === documentId
+      ? { ...item, indexingStatus: 'queued', textIndexReady: false, visualIndexReady: false, visualIndexStatus: 'queued', indexedChunks: 0 }
+      : item));
+  };
+
   // 4. Send question to Gemini PDF QA endpoint
   const handleSendMessage = async (questionText: string) => {
-    if (!questionText.trim() || !document || isLoading) return;
+    if (!questionText.trim() || !document || !document.textIndexReady || isLoading) return;
+    const documentId = document.id;
+    const currentMessages = conversations[documentId] || [];
 
     const userMessage: ChatMessage = {
       id: `msg_${Date.now()}_u`,
@@ -144,8 +264,10 @@ export default function App() {
       timestamp: Date.now(),
     };
 
-    const newMessages = [...messages, userMessage];
-    setMessages(newMessages);
+    setConversations((previous) => ({
+      ...previous,
+      [documentId]: [...(previous[documentId] || []), userMessage],
+    }));
     setIsLoading(true);
 
     try {
@@ -153,11 +275,9 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          documentId: document.id,
-          documentBase64: document.base64,
-          documentName: document.name,
+          documentId,
           question: questionText.trim(),
-          history: messages.slice(-6), // Send last 6 turns for context
+          history: currentMessages.slice(-6).map(({ role, text }) => ({ role, text })),
         }),
       });
 
@@ -177,10 +297,14 @@ export default function App() {
         isFoundInDocument: data.isFoundInDocument,
         topic: data.topic,
         suggestedFollowUps: data.suggestedFollowUps,
+        relatedVisuals: data.relatedVisuals as RelatedVisual[] | undefined,
         timestamp: Date.now(),
       };
 
-      setMessages((prev) => [...prev, assistantMessage]);
+      setConversations((previous) => ({
+        ...previous,
+        [documentId]: [...(previous[documentId] || []), assistantMessage],
+      }));
 
       // If the answer cited pages, highlight the first cited page
       if (data.pageNumbers && data.pageNumbers.length > 0) {
@@ -198,7 +322,10 @@ export default function App() {
         isError: true,
         timestamp: Date.now(),
       };
-      setMessages((prev) => [...prev, errorMessage]);
+      setConversations((previous) => ({
+        ...previous,
+        [documentId]: [...(previous[documentId] || []), errorMessage],
+      }));
     } finally {
       setIsLoading(false);
     }
@@ -219,7 +346,8 @@ export default function App() {
   };
 
   const handleClearChat = () => {
-    setMessages([]);
+    if (!document) return;
+    setConversations((previous) => ({ ...previous, [document.id]: [] }));
     setHighlightExcerpt(null);
   };
 
@@ -284,6 +412,10 @@ export default function App() {
         isOpen={isUploadModalOpen}
         onClose={() => setIsUploadModalOpen(false)}
         samples={samples}
+        documents={documents}
+        selectedDocumentId={selectedDocumentId}
+        onSelectDocument={selectDocument}
+        onRetryIndexing={handleRetryIndexing}
         onSelectSample={selectSample}
         onUploadCustomFile={handleUploadCustomFile}
         isLoading={isAnalyzingDoc}

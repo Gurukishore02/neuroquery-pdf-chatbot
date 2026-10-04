@@ -13,8 +13,9 @@ import {
   BookOpen,
   PanelRightOpen,
   ChevronLeft,
+  X,
 } from 'lucide-react';
-import { ChatMessage, DocumentInfo } from '../types.ts';
+import { ChatMessage, DocumentInfo, RelatedVisual } from '../types.ts';
 import { MarkdownView } from './MarkdownView.tsx';
 
 interface ChatAreaProps {
@@ -26,6 +27,15 @@ interface ChatAreaProps {
   onOpenUpload: () => void;
   isPdfPanelOpen?: boolean;
   onTogglePdfPanel?: () => void;
+}
+
+function limitExcerptForDisplay(excerpt: string): string {
+  if (excerpt.length <= 300) return excerpt;
+  const shortened = excerpt.slice(0, 297);
+  const sentenceBoundary = Math.max(shortened.lastIndexOf('.'), shortened.lastIndexOf('!'), shortened.lastIndexOf('?'));
+  if (sentenceBoundary >= 180) return shortened.slice(0, sentenceBoundary + 1);
+  const wordBoundary = shortened.lastIndexOf(' ');
+  return `${shortened.slice(0, wordBoundary > 0 ? wordBoundary : shortened.length).trimEnd()}...`;
 }
 
 export const ChatArea: React.FC<ChatAreaProps> = ({
@@ -40,6 +50,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 }) => {
   const [input, setInput] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [selectedVisual, setSelectedVisual] = useState<RelatedVisual | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -59,9 +70,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     }
   }, [input]);
 
+  useEffect(() => {
+    if (!selectedVisual) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSelectedVisual(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [selectedVisual]);
+
+  useEffect(() => {
+    setSelectedVisual(null);
+  }, [document?.id]);
+
   const handleSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    if (!input.trim() || isLoading || !document?.textIndexReady) return;
 
     const question = input.trim();
     setInput('');
@@ -103,6 +127,31 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
       {/* Messages Stream */}
       <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6 space-y-6">
+        {document && (
+          <div
+            role="status"
+            className={`mx-auto max-w-4xl rounded-lg border px-3 py-2 text-xs ${
+              !document.textIndexReady
+                ? document.indexingStatus === 'error'
+                  ? 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300'
+                  : 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300'
+                : document.visualIndexError
+                  ? 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300'
+                  : 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300'
+            }`}
+          >
+            {!document.textIndexReady
+              ? document.indexingStatus === 'error'
+                ? `Indexing failed: ${document.indexingError || 'Unknown error'}`
+                : 'Preparing document...'
+              : !document.visualIndexReady
+                ? document.visualIndexError
+                  ? `Document ready for chat · Visual indexing failed: ${document.visualIndexError}`
+                  : 'Document ready for chat · Visuals still processing'
+                : 'Document ready'}
+          </div>
+        )}
+
         {/* Welcome Empty State */}
         {messages.length === 0 && (
           <div className="max-w-2xl mx-auto my-auto py-8 text-center animate-in fade-in-50 duration-300">
@@ -135,7 +184,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         <button
                           key={idx}
                           onClick={() => onSendMessage(q)}
-                          className="flex items-center justify-between text-left p-3 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-indigo-400 dark:hover:border-indigo-600 bg-slate-50/50 dark:bg-slate-800/40 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/30 text-xs sm:text-sm text-slate-700 dark:text-slate-300 group transition-all"
+                          disabled={!document.textIndexReady || isLoading}
+                          className="flex items-center justify-between text-left p-3 rounded-xl border border-slate-200 dark:border-slate-800 hover:border-indigo-400 dark:hover:border-indigo-600 bg-slate-50/50 dark:bg-slate-800/40 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/30 text-xs sm:text-sm text-slate-700 dark:text-slate-300 group transition-all disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           <span className="line-clamp-2">{q}</span>
                           <ArrowRight className="w-4 h-4 text-slate-400 group-hover:text-indigo-600 dark:group-hover:text-indigo-400 flex-shrink-0 ml-2 transition-transform group-hover:translate-x-0.5" />
@@ -210,6 +260,51 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   {/* Main Answer text */}
                   <MarkdownView content={msg.text} />
 
+                  {msg.relatedVisuals && msg.relatedVisuals.length > 0 && (
+                    <section className="pt-3 border-t border-slate-200/80 dark:border-slate-700/80 space-y-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                        Related Visuals
+                      </h4>
+                      <div className="space-y-3">
+                        {msg.relatedVisuals.map((visual) => (
+                          <div key={visual.id} className="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900/70">
+                            <button
+                              type="button"
+                              onClick={() => setSelectedVisual(visual)}
+                              aria-label={`Open ${visual.title}`}
+                              className="block w-full bg-slate-100 dark:bg-slate-950 p-2"
+                            >
+                              <img
+                                src={visual.imageData}
+                                alt={visual.description}
+                                className="mx-auto max-h-56 w-full object-contain"
+                              />
+                            </button>
+                            <div className="flex flex-wrap items-start justify-between gap-3 p-3">
+                              <div className="min-w-0 space-y-1">
+                                <p className="text-sm font-semibold text-slate-800 dark:text-slate-100">{visual.title}</p>
+                                <p className="text-xs text-slate-500 dark:text-slate-400">
+                                  Type: {visual.type.charAt(0).toUpperCase() + visual.type.slice(1)} · Page {visual.pageNumber}
+                                </p>
+                                {visual.caption && (
+                                  <p className="text-xs text-slate-600 dark:text-slate-300">{visual.caption}</p>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => onPageClick(visual.pageNumber)}
+                                className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 text-xs font-semibold text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/50"
+                              >
+                                <FileText className="h-3.5 w-3.5" />
+                                View Page
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+
                   {/* Page Citation Pills */}
                   {msg.pageNumbers && msg.pageNumbers.length > 0 && (
                     <div className="pt-2 border-t border-slate-200/80 dark:border-slate-700/80 flex flex-wrap items-center gap-2">
@@ -220,7 +315,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       {msg.pageNumbers.map((pg) => (
                         <button
                           key={pg}
-                          onClick={() => onPageClick(pg, msg.relevantExcerpt)}
+                          onClick={() => onPageClick(pg, limitExcerptForDisplay(msg.relevantExcerpt || ''))}
                           title={`Jump to Page ${pg} in PDF`}
                           className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 dark:hover:bg-indigo-900 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 font-bold text-xs shadow-xs transition group cursor-pointer"
                         >
@@ -238,7 +333,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     <div
                       onClick={() =>
                         msg.pageNumbers && msg.pageNumbers[0]
-                          ? onPageClick(msg.pageNumbers[0], msg.relevantExcerpt)
+                          ? onPageClick(msg.pageNumbers[0], limitExcerptForDisplay(msg.relevantExcerpt || ''))
                           : null
                       }
                       className="p-3 rounded-xl bg-amber-50/60 dark:bg-amber-950/30 border border-amber-200/70 dark:border-amber-900/50 text-xs text-amber-900 dark:text-amber-200 space-y-1.5 cursor-pointer hover:border-amber-400 transition"
@@ -248,7 +343,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         <span>Direct Excerpt from Document:</span>
                       </div>
                       <p className="italic leading-relaxed pl-2 border-l-2 border-amber-400 dark:border-amber-600">
-                        "{msg.relevantExcerpt}"
+                        "{limitExcerptForDisplay(msg.relevantExcerpt)}"
                       </p>
                     </div>
                   )}
@@ -319,6 +414,62 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           </div>
         ))}
 
+        {selectedVisual && (
+          <div
+            role="presentation"
+            onClick={() => setSelectedVisual(null)}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 p-4"
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={selectedVisual.title}
+              onClick={(event) => event.stopPropagation()}
+              className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg border border-slate-700 bg-white shadow-2xl dark:bg-slate-900"
+            >
+              <div className="flex items-start justify-between gap-4 border-b border-slate-200 p-4 dark:border-slate-700">
+                <div className="min-w-0">
+                  <h3 className="truncate text-base font-semibold text-slate-900 dark:text-white">{selectedVisual.title}</h3>
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    Type: {selectedVisual.type.charAt(0).toUpperCase() + selectedVisual.type.slice(1)} · Page {selectedVisual.pageNumber}
+                  </p>
+                  {selectedVisual.caption && (
+                    <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">{selectedVisual.caption}</p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedVisual(null)}
+                  aria-label="Close visual preview"
+                  className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:hover:bg-slate-800 dark:hover:text-white"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto bg-slate-100 p-3 dark:bg-slate-950">
+                <img
+                  src={selectedVisual.imageData}
+                  alt={selectedVisual.description}
+                  className="mx-auto max-h-[68vh] max-w-full object-contain"
+                />
+              </div>
+              <div className="flex justify-end border-t border-slate-200 p-3 dark:border-slate-700">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onPageClick(selectedVisual.pageNumber);
+                    setSelectedVisual(null);
+                  }}
+                  className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
+                >
+                  <FileText className="h-4 w-4" />
+                  View Page
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Loading Indicator */}
         {isLoading && (
           <div className="flex gap-3 max-w-3xl mr-auto justify-start animate-in fade-in-50 duration-200">
@@ -348,10 +499,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={!document || isLoading}
+              disabled={!document || !document.textIndexReady || isLoading}
               placeholder={
                 document
-                  ? 'Ask a question about the document (e.g., What are the safety protocols?)...'
+                  ? document.textIndexReady
+                    ? 'Ask a question about the document (e.g., What are the safety protocols?)...'
+                    : 'Preparing document...'
                   : 'Upload or select a PDF first to ask questions'
               }
               rows={1}
@@ -361,7 +514,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
           <button
             type="submit"
-            disabled={!input.trim() || !document || isLoading}
+            disabled={!input.trim() || !document || !document.textIndexReady || isLoading}
             aria-label="Send question"
             className="p-3 rounded-2xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:pointer-events-none text-white font-medium shadow-xs transition flex-shrink-0"
           >

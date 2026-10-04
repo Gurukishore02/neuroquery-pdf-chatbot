@@ -36,6 +36,10 @@ export const PdfViewer: React.FC<PdfViewerProps> = ({
     }
   }, [targetPage]);
 
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [document?.id]);
+
   if (!document || !document.blobUrl) {
     return (
       <div className="h-full flex flex-col items-center justify-center p-6 text-center text-slate-400 bg-slate-50/50 dark:bg-slate-900/30 border-l border-slate-200 dark:border-slate-800">

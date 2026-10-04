@@ -1,11 +1,15 @@
 import React, { useState, useRef } from 'react';
 import { Upload, FileText, CheckCircle2, AlertCircle, X, Sparkles, BookOpen } from 'lucide-react';
-import { SampleDocumentItem } from '../types.ts';
+import { DocumentInfo, SampleDocumentItem } from '../types.ts';
 
 interface UploadModalProps {
   isOpen: boolean;
   onClose: () => void;
   samples: SampleDocumentItem[];
+  documents: DocumentInfo[];
+  selectedDocumentId: string | null;
+  onSelectDocument: (documentId: string) => Promise<void>;
+  onRetryIndexing: (documentId: string) => Promise<void>;
   onSelectSample: (sampleId: string) => Promise<void>;
   onUploadCustomFile: (file: File) => Promise<void>;
   isLoading: boolean;
@@ -17,6 +21,10 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   isOpen,
   onClose,
   samples,
+  documents,
+  selectedDocumentId,
+  onSelectDocument,
+  onRetryIndexing,
   onSelectSample,
   onUploadCustomFile,
   isLoading,
@@ -123,6 +131,74 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           </div>
         ) : (
           <div className="space-y-6">
+            {documents.length > 0 && (
+              <section>
+                <div className="flex items-center justify-between gap-3 mb-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-100">Documents</h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{documents.length} available</p>
+                  </div>
+                </div>
+                <div className="max-h-52 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800 border-y border-slate-100 dark:border-slate-800">
+                  {documents.map((document) => {
+                    const isSelected = document.id === selectedDocumentId;
+                    const status = document.indexingStatus || 'ready';
+                    const textReady = document.textIndexReady ?? status === 'ready';
+                    const visualReady = document.visualIndexReady ?? true;
+                    const hasIndexError = status === 'error' || document.visualIndexStatus === 'error';
+                    const statusLabel = !textReady
+                      ? status === 'error' ? 'Indexing failed' : status === 'queued' ? 'Queued' : 'Preparing document...'
+                      : !visualReady
+                        ? document.visualIndexStatus === 'error' ? 'Ready for chat · Visual indexing failed' : 'Ready for chat · Visuals still processing'
+                        : 'Ready';
+                    const statusColor = !textReady || hasIndexError
+                      ? hasIndexError ? 'text-red-600 dark:text-red-400' : 'text-amber-700 dark:text-amber-400'
+                      : 'text-emerald-700 dark:text-emerald-400';
+                    const statusError = textReady ? document.visualIndexError : document.indexingError;
+                    return (
+                      <div
+                        key={document.id}
+                        className={`flex w-full items-center gap-3 px-3 py-2.5 transition ${isSelected ? 'bg-indigo-50 dark:bg-indigo-950/50' : 'hover:bg-slate-50 dark:hover:bg-slate-800/60'}`}
+                      >
+                        <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center">
+                          {isSelected && <CheckCircle2 className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onSelectDocument(document.id)}
+                          aria-current={isSelected ? 'true' : undefined}
+                          className="min-w-0 flex-1 text-left text-slate-700 dark:text-slate-200"
+                        >
+                          <span className="block truncate text-sm font-medium">{document.name}</span>
+                          <span className="block text-xs text-slate-500 dark:text-slate-400">
+                            {document.pageCount > 0 ? `${document.pageCount} ${document.pageCount === 1 ? 'page' : 'pages'}` : 'Reading pages...'}
+                            <span className={`ml-2 ${statusColor}`} title={statusError}>
+                              {statusLabel}
+                            </span>
+                          </span>
+                        </button>
+                        {hasIndexError && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                await onRetryIndexing(document.id);
+                              } catch (err: any) {
+                                setError(err.message || 'Could not retry document indexing.');
+                              }
+                            }}
+                            className="flex-shrink-0 px-2 py-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 dark:hover:text-indigo-200"
+                          >
+                            Retry
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
             {/* Drop Zone */}
             <div
               onDragOver={handleDragOver}
